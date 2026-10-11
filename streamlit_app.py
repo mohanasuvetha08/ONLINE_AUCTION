@@ -13,6 +13,7 @@ def get_db():
 if "user" not in st.session_state:
     st.session_state.user = None
 
+# LOGIN AND REGISTRATION
 if st.session_state.user:
     st.success(f"Logged in as {st.session_state.user}")
     if st.button("Logout"):
@@ -20,31 +21,37 @@ if st.session_state.user:
         st.rerun()
 else:
     action = st.radio("Account", ["Login", "Register"], horizontal=True)
-    username = st.text_input("Username")
+    username = st.text_input("Username").strip()
     password = st.text_input("Password", type="password")
 
     if st.button(action):
-        try:
-            with get_db() as conn:
-                if action == "Register":
-                    conn.execute(
-                        "INSERT INTO users (username, password_hash) VALUES (%s, %s)",
-                        (username, generate_password_hash(password))
-                    )
-                    st.success("Account created. Please log in.")
-                else:
-                    row = conn.execute(
-                        "SELECT password_hash FROM users WHERE username = %s",
-                        (username,)
-                    ).fetchone()
-                    if row and check_password_hash(row[0], password):
-                        st.session_state.user = username
-                        st.rerun()
+        if not username or not password:
+            st.error("Enter both username and password.")
+        else:
+            try:
+                with get_db() as conn:
+                    if action == "Register":
+                        conn.execute(
+                            """INSERT INTO users (username, password_hash)
+                               VALUES (%s, %s)""",
+                            (username, generate_password_hash(password))
+                        )
+                        st.success("Account created. Please log in.")
                     else:
-                        st.error("Invalid username or password.")
-        except Exception:
-            st.error("Could not complete the request. Check the database settings or username.")
+                        row = conn.execute(
+                            "SELECT password_hash FROM users WHERE username = %s",
+                            (username,)
+                        ).fetchone()
 
+                        if row and check_password_hash(row[0], password):
+                            st.session_state.user = username
+                            st.rerun()
+                        else:
+                            st.error("Invalid username or password.")
+            except Exception as e:
+                st.error(f"Account error: {e}")
+
+st.divider()
 st.subheader("Available Products")
 
 try:
@@ -59,6 +66,9 @@ try:
             ORDER BY p.product_id
         """).fetchall()
 
+    if not products:
+        st.info("No products found.")
+
     for pid, name, description, price, highest in products:
         with st.container(border=True):
             st.subheader(name)
@@ -70,38 +80,60 @@ try:
                 amount = st.number_input(
                     f"Your bid for {name} (₹)",
                     min_value=0.0,
-                    value=float(highest) + 100,
+                    value=float(highest) + 100.0,
                     step=50.0,
                     key=f"bid_{pid}"
                 )
-                if st.button(f"Place bid — {name}", key=f"place_{pid}"):
+
+                if st.button("Place bid", key=f"place_{pid}"):
                     try:
                         with get_db() as conn:
-                            current = conn.execute("""
-                                SELECT GREATEST(
-                                    p.starting_price,
-                                    COALESCE(MAX(b.bid_amount), 0)
-                                )
-                                FROM products p
-                                LEFT JOIN bids b ON p.product_id = b.product_id
-                                WHERE p.product_id = %s
-                                GROUP BY p.product_id
-                            """, (pid,)).fetchone()[0]
+                            # Lock the product row while checking and inserting.
+                            product = conn.execute("""
+                                SELECT starting_price
+                                FROM products
+                                WHERE product_id = %s
+                                FOR UPDATE
+                            """, (pid,)).fetchone()
 
-                            if amount <= float(current):
-                                st.error("Your bid must exceed the current highest bid.")
+                            if not product:
+                                st.error("Product not found.")
                             else:
-                                uid = conn.execute(
-                                    "SELECT user_id FROM users WHERE username = %s",
-                                    (st.session_state.user,)
-                                ).fetchone()[0]
-                                conn.execute("""
-                                    INSERT INTO bids (user_id, product_id, bid_amount)
-                                    VALUES (%s, %s, %s)
-                                """, (uid, pid, amount))
-                                st.success("Bid placed successfully!")
-                                st.rerun()
-                    except Exception:
-                        st.error("Could not place the bid. Please try again.")
-except Exception:
-    st.warning("Connect the Supabase database to display products.")
+                                latest = conn.execute("""
+                                    SELECT MAX(bid_amount)
+                                    FROM bids
+                                    WHERE product_id = %s
+                                """, (pid,)).fetchone()[0]
+
+                                current = max(
+                                    float(product[0]),
+                                    float(latest) if latest is not None else 0.0
+                                )
+
+                                if amount <= current:
+                                    st.error(
+                                        f"Bid must exceed ₹{current:.2f}."
+                                    )
+                                else:
+                                    user_row = conn.execute(
+                                        "SELECT user_id FROM users WHERE username = %s",
+                                        (st.session_state.user,)
+                                    ).fetchone()
+
+                                    if not user_row:
+                                        st.error("User account not found.")
+                                    else:
+                                        conn.execute("""
+                                            INSERT INTO bids
+                                                (user_id, product_id, bid_amount)
+                                            VALUES (%s, %s, %s)
+                                        """, (user_row[0], pid, amount))
+
+                                        st.success("Bid placed successfully!")
+                                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"Bid failed: {e}")
+
+except Exception as e:
+    st.error(f"Product/database error: {e}")
